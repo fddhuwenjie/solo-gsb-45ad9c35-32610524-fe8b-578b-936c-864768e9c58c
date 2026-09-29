@@ -1,6 +1,6 @@
 # OpenAPI 契约兼容性审计 API
 
-用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供六个接口：
+用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供七个接口：
 
 - **`POST /audit`**：提交**基线版**与**候选版**两份 OpenAPI 3.x JSON 文档，服务会解析本地 `$ref`（循环安全），并按以下策略判定候选版是否向后兼容：
 
@@ -45,6 +45,20 @@
   百分号编码。缺少必填值、未知值、重复参数、值与样式不匹配或悬空 / 循环引用一律
   返回 422，并附来源 JSON Pointer；输出稳定且不修改请求对象。
 
+- **`POST /callbacks/resolve`**：提交**一份** OpenAPI 3.x 文档、一个 `METHOD /path`
+  操作选择器与**一次请求 / 响应上下文**（`request` 的 `url` / `method` /
+  `path` / `query` / `header` / `body`，`response` 的 `statusCode` / `header` /
+  `body`），解析该操作 `callbacks` 中声明的**异步回调实际 URL**。回调对象与各
+  表达式键对应的 Path Item 都经**循环安全的本地 `$ref`** 解析（含 OpenAPI 3.1
+  同级字段合并；3.0 忽略同级字段）；回调键可以是**纯字面量**、**裸 Runtime
+  Expression**，也可以把字面文字与 `{...}` Runtime Expression 混合拼接。支持
+  `$url`、`$method`、`$statusCode`、请求侧 `path` / `query` / `header` /
+  `body` 与响应侧 `header` / `body` 表达式：body 片段按 **JSON Pointer**
+  （RFC 6901，支持 `~0` / `~1` 转义与数组下标）取值，header 名**大小写不敏感**。
+  缺值、非法表达式、非标量（对象 / 数组 / `null`）插值以及悬空 / 外部 / 循环引用
+  一律返回 422，并同时给出**回调条目与表达式键的来源 JSON Pointer**；结果按来源
+  Pointer 稳定排序、保留 URL 对应的完整 Path Item，且不修改输入。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件）。在项目根目录执行：
@@ -64,6 +78,7 @@ docker compose up --build
 | 示例校验接口 | `POST http://localhost:8080/examples/validate` |
 | 覆盖动作接口 | `POST http://localhost:8080/overlay/apply` |
 | 请求物化接口 | `POST http://localhost:8080/requests/materialize` |
+| 异步回调解析接口 | `POST http://localhost:8080/callbacks/resolve` |
 | 交互式 API 文档（Swagger UI） | http://localhost:8080/docs |
 | OpenAPI 描述文档 | http://localhost:8080/openapi.json |
 
@@ -770,6 +785,160 @@ curl -s -X POST http://localhost:8080/requests/materialize \
 > 对象类型的值按键名升序序列化、数组按声明顺序序列化，同样的契约与值无论输入键序如何，
 > 始终得到字节相同的 `request_target` / `headers` / `cookie`。
 
+## `POST /callbacks/resolve`：调试契约声明的异步回调
+
+给定**一份** OpenAPI 3.x 文档、一个操作选择器与一次真实的请求 / 响应交换，
+服务解析所选操作 `callbacks` 映射中的每个 Callback Object，把其表达式键
+（Callback URL 模板）求值为**实际回调 URL**，并附上该键对应的 **Path Item
+Object**（回调到达后服务方应提供的操作契约），用于在联调 / 测试中核对回调地址。
+
+### 引用解析
+
+- `callbacks.<name>` 可以直接内联 Callback Object，也可以用本地
+  `$ref`（`#/components/callbacks/...` 或任意文档内指针）引用；
+  **引用链循环安全**，逐层跟随并受 100 层上限保护。
+- 每个表达式键映射的 Path Item Object 同样支持本地 `$ref`
+  （如 `#/components/pathItems/...`），解析结果以内联 Path Item 形态返回。
+- **OpenAPI 3.1**：Callback / Path Item 的 `$ref` 允许带同级字段，链上每层
+  同级字段从终点向引用点合并（近者优先）；**OpenAPI 3.0**：严格遵循旧规范，
+  忽略 `$ref` 同级字段，只使用引用目标。
+- 操作所在 path item 的 OpenAPI 3.1 path-level `$ref` 也会被解析后再定位操作。
+- 悬空、非本地（`http(s)://`、文件路径、协议相对 `//host`）、循环引用链、
+  引用目标不是对象，一律返回 **422**，错误指向**闭环 / 失效的那个 `$ref`**。
+
+### Runtime Expression 支持矩阵
+
+回调键要么整体是一个裸 Runtime Expression（以 `$` 开头），要么是
+**字面文字 + 若干 `{expression}` 嵌入**（按 OpenAPI 3 Callback Object 规范）；
+字面片段与各表达式求值结果按出现顺序**原样拼接**（服务不对结果做百分号编码）。
+
+| 表达式 | 含义 |
+| --- | --- |
+| `$url` | 请求的完整 URL（取 `context.request.url`） |
+| `$method` | 请求方法（取 `context.request.method`） |
+| `$statusCode` | 响应状态码（取 `context.response.statusCode`） |
+| `$request.path.<name>` / `$request.query.<name>` | 请求 path / query 参数值 |
+| `$request.header.<token>` / `$response.header.<token>` | 请求 / 响应头，**头名大小写不敏感** |
+| `$request.body` / `$response.body` | 整个请求 / 响应体（本身须为标量） |
+| `$request.body#/json/pointer` / `$response.body#/json/pointer` | body 上的 **JSON Pointer** 片段 |
+
+- body 片段按 **RFC 6901** 解析：`/` 分隔、`~1`→`/`、`~0`→`~`、数组用非负下标，
+  另按 URL fragment 规则做百分号解码；导航到不存在的属性 / 越界下标即缺值（422）。
+- 表达式名遵循规范 ABNF：path / query 名只允许 RFC 3986 未转义字符
+（字母数字与 `-._~`）与 `%HH` 百分号三元组（自动解码后再与上下文键比较），
+header 名须为 RFC 7230 token。
+- 插值结果必须是**标量**（字符串 / 数字 / 布尔）；数字按其 JSON 文本渲染、
+  布尔渲染为 `true` / `false`；对象、数组、`null` 一律 422
+  （`non_scalar_value`）。
+- 语法错误（未知来源、残缺表达式、非法名字 / 指针、花括号不配对、空 `{}`、
+  嵌入内容不以 `$` 开头）返回 422（`invalid_expression`），且一个键中的多个
+  嵌入会**逐个校验、一次报齐**。
+
+### 请求
+
+```bash
+curl -s -X POST http://localhost:8080/callbacks/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document": { "openapi": "3.0.3", "info": {"title": "Pet API", "version": "1.0"},
+                  "paths": {"/pets": {"post": {"callbacks": {"...": "..."}}}} },
+    "selector": "POST /pets",
+    "context": {
+      "request":  {"url": "https://api.example.com/pets", "method": "POST",
+                   "path": {"petId": "p42"}, "query": {"code": "ab"},
+                   "header": {"X-Token": "secret"},
+                   "body": {"owner": {"name": "sam"}}},
+      "response": {"statusCode": 201, "header": {"Location": "/created/7"},
+                   "body": {"href": "https://cb.example.com/x"}}
+    }
+  }'
+```
+
+- `document`：一份 OpenAPI 3.x JSON 文档（对象）。
+- `selector`：形如 `METHOD /path` 的单个选择器（方法大小写不敏感，路径须逐字匹配）。
+- `context`：一次请求 / 响应交换。`request` 可含 `url` / `method`（字符串）、
+  `path` / `query` / `header`（名称到值的对象）、`body`（任意 JSON）；
+  `response` 可含 `statusCode`（整数）、`header`（对象）、`body`（任意 JSON）。
+  两侧均可省略。
+
+### 成功响应（`200`）
+
+```json
+{
+  "callbacks": [
+    {
+      "name": "onCreated",
+      "callback_pointer": "/paths/~1pets/post/callbacks/onCreated",
+      "expression_pointer": "/components/callbacks/OnCreated/https:~1~1cb.example.com~1hook~1{$request.path.petId}",
+      "expression": "https://cb.example.com/hook/{$request.path.petId}?s={$statusCode}",
+      "url": "https://cb.example.com/hook/p42?s=201",
+      "path_item": {
+        "post": {"responses": {"200": {"description": "ok"}}}
+      }
+    }
+  ]
+}
+```
+
+- `name`：操作 `callbacks` 映射中的回调名。
+- `callback_pointer`：回调条目（可能是 `$ref` 所在处）的 JSON Pointer。
+- `expression_pointer`：表达式键**物理位置**的 JSON Pointer——纯 3.0 `$ref`
+  解析时指向组件内键的位置；3.1 同级覆盖键指向引用点。报错与成功结果都使用同一约定。
+- `expression` / `url`：原始键文本与求值拼接后的实际 URL。
+- `path_item`：该键对应的 Path Item Object（本地 `$ref` 已内联、3.1 同级已合并）。
+- 操作没有 `callbacks` 时返回 `{"callbacks": []}`；条目按
+  `(callback_pointer, expression_pointer)` **稳定排序**，与文档键序无关。
+
+### 错误响应
+
+- `400 invalid_openapi_document`：`document` 缺少 `openapi: 3.x` 或 `paths` 对象。
+- `400 invalid_selector`：选择器不是 `METHOD /path` 形态，或路径 / 方法不存在
+  （path-level `$ref` 提供的方法同样认可；该引用自身损坏属于 422）。
+- `400 invalid_context`：`context` 不是对象、含未知成员（只允许 `request` /
+  `response`）、`request` / `response` 不是对象、字段类型不符
+  （`url` / `method` 非字符串、`statusCode` 非整数、各映射非对象、含未知字段）。
+- `422 callback_resolution_failed`：全部语义问题一次报齐，`errors` 按
+  `(code, callback_pointer, expression_pointer, expression, ref, error)` 稳定排序，
+  每条至少带 `callback_pointer`，表达式相关错误另带 `expression_pointer` 与
+  `expression`：
+
+| code | 触发情形 |
+| --- | --- |
+| `missing_value` | `$url` / `$method` / `$statusCode` 无值；引用了未提供的侧 / 映射 / 参数 / 头 / body；body JSON Pointer 属性不存在或数组越界 |
+| `invalid_expression` | 未知 / 残缺表达式、非法名字或头 token、非法 body 指针、空 `{}`、花括号不配对、嵌入不以 `$` 开头 |
+| `non_scalar_value` | 表达式取到对象 / 数组 / `null`，无法插值进 URL |
+| `unresolvable_reference` | Callback / Path Item 的本地 `$ref` 悬空、非本地、目标非对象或循环；附 `ref` 与 `ref_pointer` |
+| `invalid_callback` | 回调条目非对象、Callback Object 无任何表达式键、表达式未映射到对象等 |
+
+```json
+{
+  "error": "callback_resolution_failed",
+  "message": "one or more callbacks could not be resolved; fix the reported references or runtime expressions first",
+  "errors": [
+    {
+      "code": "missing_value",
+      "callback_pointer": "/paths/~1pets/post/callbacks/onCreated",
+      "expression_pointer": "/paths/~1pets/post/callbacks/onCreated/hook~1{$request.path.missing}",
+      "expression": "$request.path.missing",
+      "context_pointer": "/context/request/path",
+      "error": "runtime expression '$request.path.missing': path parameter 'missing' is absent from the supplied context"
+    },
+    {
+      "code": "unresolvable_reference",
+      "callback_pointer": "/paths/~1pets/post/callbacks/onCreated",
+      "expression_pointer": "/components/callbacks/OnCreated/{$request.path.petId}",
+      "expression": "{$request.path.petId}",
+      "ref": "#/components/pathItems/Missing",
+      "ref_pointer": "/components/callbacks/OnCreated/{$request.path.petId}",
+      "error": "unresolvable reference '#/components/pathItems/Missing': object has no property 'Missing'"
+    }
+  ]
+}
+```
+
+> 求值过程**不会修改**请求中的 `document` / `context`；返回的 Path Item 是深拷贝，
+> 调用方对响应的修改不会回写到输入文档。
+
 ## 检查的变更类别
 
 | category | 说明 | 判定为 breaking 的方向 |
@@ -870,7 +1039,18 @@ path-level 与 operation-level 参数合并（后者按 `(in, name)` 覆盖、
 （含两处 Pointer）、参数与 3.1 path-level `$ref` 解析（悬空 / 外部 / 循环 422、
 3.1 同级字段覆盖、3.0 忽略同级）、必填缺失 / 未知值 / 歧义 header 键 422、
 路径模板一致性、400 文档 / 选择器 / 请求包体边界、多错误齐报与稳定排序、
-输出与输入键序无关、请求对象不被修改等共 326 个用例。
+输出与输入键序无关、请求对象不被修改；
+以及 `/callbacks/resolve` 的字面量 / 裸表达式 / 字面量加嵌入混合拼接，
+`$url` / `$method` / `$statusCode` 与请求·响应的 path/query/header/body
+表达式矩阵、body JSON Pointer（转义 token、数组下标、越界、标量整体 body）、
+header 大小写不敏感匹配、标量渲染（数字 / 布尔）与对象·数组·null 非标量 422、
+缺值与非法表达式（未知来源、残缺表达式、非法名字 / 头 token / 指针、
+空花括号与不配对花括号、嵌入不以 `$` 开头）多错误齐报、
+Callback / Path Item 本地 `$ref` 解析（悬空 / 外部 / 循环 / 目标非对象 422、
+3.0 忽略同级与 3.1 同级覆盖、path-level `$ref` 操作定位）、
+回调与表达式双层来源 Pointer、按来源稳定排序与键序无关、
+Path Item 保留与深拷贝、输入对象不被修改、400 文档 / 选择器 / 上下文包体边界
+等共 382 个用例。
 
 ## 项目结构
 
@@ -878,13 +1058,14 @@ path-level 与 operation-level 参数合并（后者按 `(in, name)` 覆盖、
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate、/overlay/apply 与 /requests/materialize）
+│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate、/overlay/apply、/requests/materialize 与 /callbacks/resolve）
 │   ├── audit.py         # 契约比较引擎（操作/参数/请求体/响应/schema）
 │   ├── slicer.py        # 最小子契约切片（选择器校验、security 继承、$ref 闭包重建、SHA-256）
 │   ├── composer.py      # 网关契约合成（前缀规范化、命名空间化、$ref 改写、冲突检测、来源映射）
 │   ├── examples.py      # 媒体类型示例校验（方向化 readOnly/writeOnly/required、3.0/3.1 可空性、JSON Schema 关键字）
 │   ├── overlay.py       # 有序覆盖动作（受限 JSONPath 解析、命中冻结、递归合并/倒序删除、SHA-256）
 │   ├── materializer.py  # 请求物化（参数合并、循环安全 $ref、path/query/header/cookie 样式序列化、百分号编码）
+│   ├── callbacks.py     # 异步回调解析（循环安全 $ref、Runtime Expression 求值、JSON Pointer、URL 拼接）
 │   └── refresolver.py   # 本地 $ref 解析（RFC 6901 指针 + 循环检测）
 ├── tests/
 │   ├── test_audit_api.py
@@ -892,7 +1073,8 @@ path-level 与 operation-level 参数合并（后者按 `(in, name)` 覆盖、
 │   ├── test_compose_api.py
 │   ├── test_examples_api.py
 │   ├── test_overlay_api.py
-│   └── test_materialize_api.py
+│   ├── test_materialize_api.py
+│   └── test_callbacks_api.py
 ├── Dockerfile           # 容器封装全部依赖，非 root 用户运行，含 HEALTHCHECK
 ├── docker-compose.yml   # 一条命令启动，映射 8080 端口
 ├── requirements.txt

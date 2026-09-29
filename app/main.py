@@ -8,6 +8,13 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .callbacks import (
+    CallbackResolutionError,
+    InvalidContextError,
+    InvalidDocumentError as InvalidCallbackDocumentError,
+    InvalidSelectorError as InvalidCallbackSelectorError,
+    resolve_callbacks,
+)
 from .audit import compare_documents, validate_references
 from .composer import (
     ComposeReferenceError,
@@ -94,7 +101,19 @@ app = FastAPI(
         "header simple, cookie form), including arrays, objects, "
         "allowReserved, repeated query keys and percent-encoding; missing "
         "required values, unknown or duplicate parameters and dangling "
-        "references return 422 with source JSON Pointers."
+        "references return 422 with source JSON Pointers. "
+        "POST /callbacks/resolve debugs an operation's asynchronous "
+        "callbacks: each operation 'callbacks' entry and its expression "
+        "keys' Path Items are reached through cycle-safe local $refs, and "
+        "the literal key text plus its '{...}' Runtime Expressions "
+        "($url, $method, $statusCode, request/response "
+        "path/query/header/body, body fragments by JSON Pointer, headers "
+        "case-insensitively) are concatenated into the concrete callback "
+        "URL; missing values, illegal expressions, non-scalar "
+        "interpolations and dangling/external/circular references return "
+        "422 with the source JSON Pointers of both the callback and the "
+        "expression, results sort stably by source pointer and the input "
+        "is never modified."
     ),
 )
 
@@ -284,6 +303,77 @@ class MaterializeResponse(BaseModel):
         ),
     )
 
+
+class CallbackResolveRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document declaring the callbacks."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The operation whose callbacks are resolved, in the "
+            "'METHOD /path' form (e.g. 'POST /pets'); method is "
+            "case-insensitive."
+        ),
+    )
+    context: Any = Field(
+        ...,
+        description=(
+            "One concrete request/response exchange used to evaluate the "
+            "callback keys' runtime expressions: an object with optional "
+            "'request' ('url'/'method' strings, 'path'/'query'/'header' "
+            "objects, 'body') and 'response' ('statusCode' integer, "
+            "'header' object, 'body') members."
+        ),
+    )
+
+
+class ResolvedCallbackModel(BaseModel):
+    name: str = Field(
+        ..., description="The callback's name in the operation's 'callbacks' map."
+    )
+    callback_pointer: str = Field(
+        ...,
+        description=(
+            "JSON Pointer of the callback map entry (e.g. "
+            "'/paths/~1pets/post/callbacks/onCreated')."
+        ),
+    )
+    expression_pointer: str = Field(
+        ...,
+        description=(
+            "Physical JSON Pointer of the runtime-expression key: inside "
+            "a referenced component for a plain 3.0 $ref, at the "
+            "referencing node for a 3.1 sibling key (RFC 6901 escaped)."
+        ),
+    )
+    expression: str = Field(..., description="The Callback Object key verbatim.")
+    url: str = Field(
+        ...,
+        description=(
+            "The concrete callback URL: literal key fragments and the "
+            "values of the embedded '{...}' runtime expressions concatenated."
+        ),
+    )
+    path_item: Dict[str, Any] = Field(
+        ...,
+        description=(
+            "The Path Item Object paired with the key, with a local "
+            "'$ref' resolved cycle-safely (3.1 siblings merged)."
+        ),
+    )
+
+
+class CallbackResolveResponse(BaseModel):
+    callbacks: List[ResolvedCallbackModel] = Field(
+        ...,
+        description=(
+            "One entry per callback expression key, sorted stably by "
+            "(callback_pointer, expression_pointer)."
+        ),
+    )
+
+
 class ExampleErrorModel(BaseModel):
     side: Literal["request", "response"] = Field(
         ..., description="Whether the example belongs to a requestBody or a response."
@@ -398,6 +488,7 @@ def root() -> Dict[str, str]:
         "examples_validate": "POST /examples/validate",
         "overlay_apply": "POST /overlay/apply",
         "requests_materialize": "POST /requests/materialize",
+        "callbacks_resolve": "POST /callbacks/resolve",
     }
 
 
@@ -744,5 +835,71 @@ def requests_materialize(payload: MaterializeRequest) -> JSONResponse:
             "request_target": request_target,
             "headers": headers,
             "cookie": cookie,
+        },
+    )
+
+
+@app.post(
+    "/callbacks/resolve",
+    response_model=CallbackResolveResponse,
+    responses={
+        400: {
+            "description": "The document is not OpenAPI 3.x, the selector "
+            "is malformed/unknown, or the context envelope is malformed"
+        },
+        422: {
+            "description": "A callback or path-item $ref is dangling, "
+            "external or circular, a Callback Object is malformed, or a "
+            "runtime expression is illegal / has no scalar value; each "
+            "error carries the source JSON Pointer of the callback and "
+            "the expression"
+        },
+    },
+    summary="Resolve an operation's async callback URLs for one exchange",
+)
+def callbacks_resolve(payload: CallbackResolveRequest) -> JSONResponse:
+    try:
+        callbacks = resolve_callbacks(
+            payload.document,
+            payload.selector,
+            payload.context,
+        )
+    except InvalidCallbackDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except InvalidCallbackSelectorError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_selector", "messages": exc.messages},
+        )
+    except InvalidContextError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_context", "messages": exc.messages},
+        )
+    except CallbackResolutionError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "callback_resolution_failed",
+                "message": (
+                    "one or more callbacks could not be resolved; fix the "
+                    "reported references or runtime expressions first"
+                ),
+                "errors": exc.errors,
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "callbacks": [
+                ResolvedCallbackModel(**callback).model_dump()
+                for callback in callbacks
+            ]
         },
     )
